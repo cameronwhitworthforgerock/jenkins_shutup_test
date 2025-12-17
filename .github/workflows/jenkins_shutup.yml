@@ -135,11 +135,13 @@ jobs:
               console.log("DRY RUN ENABLED - No changes made.");
             } else {
               for (const comment of toMinimize) {
+                // CORRECTION HERE: Removed the extra 'minimizeCommentPayload' nesting
                 const mutation = `
                   mutation($subjectId: ID!) {
                     minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
-                      minimizeCommentPayload {
-                        clientMutationId
+                      clientMutationId
+                      minimizedComment {
+                        isMinimized
                       }
                     }
                   }
