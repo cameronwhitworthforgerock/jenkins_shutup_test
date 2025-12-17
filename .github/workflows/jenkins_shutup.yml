@@ -19,7 +19,7 @@ jobs:
           script: |
             // ================= CONFIGURATION =================
             const JENKINS_USER = 'KennethStubbings';
-            const SIMILARITY_THRESHOLD = 0.80; // x% match
+            const SIMILARITY_THRESHOLD = 0.60; // x% match
             
             // SET THIS TO TRUE TO TEST WITHOUT HIDING COMMENTS
             const DRY_RUN = false; 
