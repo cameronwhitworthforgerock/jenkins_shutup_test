@@ -23,7 +23,7 @@ jobs:
             const SIMILARITY_THRESHOLD = 0.95; // 95% match
             
             // SET THIS TO TRUE TO TEST WITHOUT HIDING COMMENTS
-            const DRY_RUN = true; 
+            const DRY_RUN = false; 
             // =================================================
 
             // --- Levenshtein Distance Algorithm ---
