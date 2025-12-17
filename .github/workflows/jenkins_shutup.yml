@@ -23,7 +23,7 @@ jobs:
 
             // 2. Filter for comments where the username includes "jenkins"
             const jenkinsComments = comments.filter(c => 
-              c.user.login.toLowerCase().includes('jenkins')
+              c.user.login.toLowerCase().includes('kennethstubbings')
             );
 
             console.log(`Found ${jenkinsComments.length} Jenkins comments.`);
