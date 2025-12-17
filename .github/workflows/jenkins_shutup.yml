@@ -7,6 +7,8 @@ on:
 jobs:
   deduplicate:
     # Only run if the comment is from the Jenkins bot
+    # (Note: You might want to remove this 'if' temporarily if testing with your own user)
+    # if: github.event.comment.user.login == 'KennethStubbings'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -19,7 +21,7 @@ jobs:
           script: |
             // ================= CONFIGURATION =================
             const JENKINS_USER = 'KennethStubbings';
-            const SIMILARITY_THRESHOLD = 0.80; // x% match
+            const SIMILARITY_THRESHOLD = 0.80; 
             
             // SET THIS TO TRUE TO TEST WITHOUT HIDING COMMENTS
             const DRY_RUN = false; 
@@ -50,42 +52,58 @@ jobs:
               return matrix[b.length][a.length];
             }
 
-            function getSimilarity(s1, s2) {
+            function getSimilarity(s1, s2, id1, id2) {
               const longer = s1.length > s2.length ? s1 : s2;
               if (longer.length === 0) return 1.0;
               
-              // Optimization: If length difference is already greater than allowed 
-              // mismatch, don't run expensive Levenshtein.
-              // e.g. for 95%, if length diff is > 5%, they can't match.
               const lenDiff = Math.abs(s1.length - s2.length);
-              if (lenDiff / longer.length > (1 - SIMILARITY_THRESHOLD)) {
+              const maxAllowedDiff = longer.length * (1 - SIMILARITY_THRESHOLD);
+
+              // LOGGING: Check if length optimization is triggering
+              if (lenDiff > maxAllowedDiff) {
+                console.log(`[DEBUG] Skipped comparison between ${id1} and ${id2}.`);
+                console.log(`       Reason: Length diff (${lenDiff}) > Allowed (${maxAllowedDiff.toFixed(2)}). Threshold is strict.`);
                 return 0; 
               }
 
               const distance = levenshtein(s1, s2);
-              return (longer.length - distance) / longer.length;
+              const score = (longer.length - distance) / longer.length;
+              return score;
             }
 
             // 1. Fetch comments
+            // Note: We added 'per_page: 100' to try and get more comments, 
+            // as the default is often only 30.
             console.log(`Fetching comments for PR #${context.issue.number}...`);
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
+              per_page: 100, 
             });
+
+            console.log(`[DEBUG] Raw API returned ${comments.length} comments.`);
 
             // 2. Filter Jenkins comments and sort NEWEST first
             const jenkinsComments = comments
-              .filter(c => c.user.login === JENKINS_USER && !c.is_minimized)
+              .filter(c => {
+                 const isTargetUser = c.user.login === JENKINS_USER;
+                 // Debug if 'is_minimized' is actually present
+                 if (isTargetUser && c.is_minimized === undefined) {
+                    console.log(`[WARNING] Comment ${c.id} has undefined 'is_minimized' property! REST API might not be returning it.`);
+                 }
+                 return isTargetUser && !c.is_minimized;
+              })
               .sort((a, b) => b.id - a.id);
             
+            console.log(`[DEBUG] After filtering for user '${JENKINS_USER}' and !minimized: ${jenkinsComments.length} comments remain.`);
+
             if (jenkinsComments.length < 2) {
               console.log("Not enough comments to group.");
               return;
             }
 
             // 3. CLUSTERING LOGIC
-            // "Groups" will contain the 'Representative' (Newest) and a list of 'Duplicates' (Older)
             const groups = [];
 
             for (const comment of jenkinsComments) {
@@ -93,18 +111,19 @@ jobs:
 
               // Check if this comment belongs to an existing group
               for (const group of groups) {
-                const score = getSimilarity(group.representative.body, comment.body);
+                // Pass IDs to helper for better logging
+                const score = getSimilarity(group.representative.body, comment.body, group.representative.id, comment.id);
                 
                 if (score >= SIMILARITY_THRESHOLD) {
-                  // Found a match! This comment is an older version of this group
                   group.duplicates.push(comment);
                   placedInGroup = true;
                   console.log(`-> Comment ${comment.id} grouped with ${group.representative.id} (Similarity: ${(score*100).toFixed(2)}%)`);
                   break;
+                } else {
+                   console.log(`[DEBUG] No match: ${comment.id} vs ${group.representative.id} was only ${(score*100).toFixed(2)}%`);
                 }
               }
 
-              // If it didn't match any existing group, it becomes the representative of a NEW group
               if (!placedInGroup) {
                 groups.push({
                   representative: comment,
@@ -135,7 +154,6 @@ jobs:
               console.log("DRY RUN ENABLED - No changes made.");
             } else {
               for (const comment of toMinimize) {
-                // CORRECTION HERE: Removed the extra 'minimizeCommentPayload' nesting
                 const mutation = `
                   mutation($subjectId: ID!) {
                     minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
