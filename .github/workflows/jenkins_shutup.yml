@@ -18,7 +18,7 @@ jobs:
         with:
           script: |
             // ================= CONFIGURATION =================
-            const JENKINS_USER = 'kennethstubbings';
+            const JENKINS_USER = 'KennethStubbings';
             const SIMILARITY_THRESHOLD = 0.95; // 95% match
             
             // SET THIS TO TRUE TO TEST WITHOUT HIDING COMMENTS
@@ -79,6 +79,11 @@ jobs:
               .filter(c => c.user.login === JENKINS_USER && !c.is_minimized)
               .sort((a, b) => b.id - a.id);
 
+            if (JENKINS_USER != c.user.login) {
+              console.log("name not found");
+              return;
+            }
+            
             if (jenkinsComments.length < 2) {
               console.log("Not enough comments to group.");
               return;
