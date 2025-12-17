@@ -1,55 +1,156 @@
-name: Jenkins Shut Up
+name: Jenkins Comment Janitor
+
 on:
   issue_comment:
     types: [created]
 
 jobs:
-  minimize-jenkins-noise:
+  deduplicate:
+    # Only run if the comment is from the Jenkins bot
+    if: github.event.comment.user.login == 'jenkins-bot-username'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
+      issues: write
 
     steps:
-      - name: Minimize Jenkins Comments
+      - name: Group and Minimize Comments
         uses: actions/github-script@v7
         with:
           script: |
-            // 1. Get all comments currently on the PR
+            // ================= CONFIGURATION =================
+            const JENKINS_USER = 'kennethstubbings';
+            const SIMILARITY_THRESHOLD = 0.95; // 95% match
+            
+            // SET THIS TO TRUE TO TEST WITHOUT HIDING COMMENTS
+            const DRY_RUN = true; 
+            // =================================================
+
+            // --- Levenshtein Distance Algorithm ---
+            function levenshtein(a, b) {
+              if (a.length === 0) return b.length;
+              if (b.length === 0) return a.length;
+              
+              const matrix = [];
+              for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+              for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+              for (let i = 1; i <= b.length; i++) {
+                for (let j = 1; j <= a.length; j++) {
+                  if (b.charAt(i - 1) === a.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                  } else {
+                    matrix[i][j] = Math.min(
+                      matrix[i - 1][j - 1] + 1,
+                      matrix[i][j - 1] + 1,
+                      matrix[i - 1][j] + 1
+                    );
+                  }
+                }
+              }
+              return matrix[b.length][a.length];
+            }
+
+            function getSimilarity(s1, s2) {
+              const longer = s1.length > s2.length ? s1 : s2;
+              if (longer.length === 0) return 1.0;
+              
+              // Optimization: If length difference is already greater than allowed 
+              // mismatch, don't run expensive Levenshtein.
+              // e.g. for 95%, if length diff is > 5%, they can't match.
+              const lenDiff = Math.abs(s1.length - s2.length);
+              if (lenDiff / longer.length > (1 - SIMILARITY_THRESHOLD)) {
+                return 0; 
+              }
+
+              const distance = levenshtein(s1, s2);
+              return (longer.length - distance) / longer.length;
+            }
+
+            // 1. Fetch comments
+            console.log(`Fetching comments for PR #${context.issue.number}...`);
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
 
-            // 2. Filter for comments where the username includes "jenkins"
-            const jenkinsComments = comments.filter(c => 
-              c.user.login.toLowerCase().includes('kennethstubbings')
-            );
+            // 2. Filter Jenkins comments and sort NEWEST first
+            const jenkinsComments = comments
+              .filter(c => c.user.login === JENKINS_USER && !c.is_minimized)
+              .sort((a, b) => b.id - a.id);
 
-            console.log(`Found ${jenkinsComments.length} Jenkins comments.`);
+            if (jenkinsComments.length < 2) {
+              console.log("Not enough comments to group.");
+              return;
+            }
 
-            // 3. If there's more than one, hide everything except the newest one
-            if (jenkinsComments.length > 1) {
-              // slice(0, -1) ignores the very last (most recent) Jenkins comment
-              const oldJenkinsComments = jenkinsComments.slice(0, -1);
+            // 3. CLUSTERING LOGIC
+            // "Groups" will contain the 'Representative' (Newest) and a list of 'Duplicates' (Older)
+            const groups = [];
 
-              for (const comment of oldJenkinsComments) {
-                if (comment.minimized_reason) continue;
+            for (const comment of jenkinsComments) {
+              let placedInGroup = false;
 
-                const query = `
-                  mutation($id: ID!) {
-                    minimizeComment(input: {classifier: OUTDATED, subjectId: $id}) {
-                      minimizedComment { isMinimized }
+              // Check if this comment belongs to an existing group
+              for (const group of groups) {
+                const score = getSimilarity(group.representative.body, comment.body);
+                
+                if (score >= SIMILARITY_THRESHOLD) {
+                  // Found a match! This comment is an older version of this group
+                  group.duplicates.push(comment);
+                  placedInGroup = true;
+                  console.log(`-> Comment ${comment.id} grouped with ${group.representative.id} (Similarity: ${(score*100).toFixed(2)}%)`);
+                  break;
+                }
+              }
+
+              // If it didn't match any existing group, it becomes the representative of a NEW group
+              if (!placedInGroup) {
+                groups.push({
+                  representative: comment,
+                  duplicates: []
+                });
+                console.log(`-> New Group Created. Representative: ${comment.id}`);
+              }
+            }
+
+            // 4. COLLECT TARGETS TO MINIMIZE
+            const toMinimize = [];
+            for (const group of groups) {
+              if (group.duplicates.length > 0) {
+                console.log(`Group ${group.representative.id} has ${group.duplicates.length} outdated duplicates.`);
+                toMinimize.push(...group.duplicates);
+              }
+            }
+
+            // 5. EXECUTE MINIMIZATION
+            if (toMinimize.length === 0) {
+              console.log("No duplicates found to minimize.");
+              return;
+            }
+
+            console.log(`\nTotal comments to minimize: ${toMinimize.length}`);
+
+            if (DRY_RUN) {
+              console.log("DRY RUN ENABLED - No changes made.");
+            } else {
+              for (const comment of toMinimize) {
+                const mutation = `
+                  mutation($subjectId: ID!) {
+                    minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
+                      minimizeCommentPayload {
+                        clientMutationId
+                      }
                     }
                   }
                 `;
-                const variables = { id: comment.node_id };
                 
                 try {
-                  await github.graphql(query, variables);
-                  console.log(`Minimized old Jenkins status: ${comment.id}`);
+                  await github.graphql(mutation, { subjectId: comment.node_id });
+                  console.log(`Minimized comment ${comment.id}`);
                 } catch (error) {
-                  console.log(`Failed to hide ${comment.id}: ${error.message}`);
+                  console.error(`Error minimizing ${comment.id}:`, error);
                 }
               }
             }
