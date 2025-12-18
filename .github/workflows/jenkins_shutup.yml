@@ -75,11 +75,11 @@ jobs:
             // Note: We added 'per_page: 100' to try and get more comments, 
             // as the default is often only 30.
             console.log(`Fetching comments for PR #${context.issue.number}...`);
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              per_page: 100, 
+              per_page: 100, // Ask for max per page to reduce number of API calls
             });
 
             console.log(`[DEBUG] Raw API returned ${comments.length} comments.`);
