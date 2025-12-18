@@ -7,6 +7,8 @@ on:
 jobs:
   deduplicate:
     # Only run if the comment is from the Jenkins bot
+    # (Note: Enable this check once you are done testing manually)
+    if: github.event.comment.user.login == 'KennethStubbings'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -17,11 +19,67 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // ================= CONFIGURATION =================
+            // ================= DEFAULTS =================
             const JENKINS_USER = 'KennethStubbings';
-            const SIMILARITY_THRESHOLD = 0.80; 
+            let similarityThreshold = 0.95; // Default strictness (95%)
             const DRY_RUN = false; 
-            // =================================================
+            // ============================================
+
+            // --- 1. CONFIGURATION PARSING ---
+            console.log("[CONFIG] Scanning PR description for 'Jenkins Cleanup Configuration:' block...");
+            
+            const prBody = context.payload.issue.body || "";
+            const lines = prBody.split(/\r?\n/);
+            let foundHeader = false;
+            const config = {};
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+
+              if (!foundHeader) {
+                // Look for the header to start the block
+                if (trimmed.includes("Jenkins Cleanup Configuration:")) {
+                  foundHeader = true;
+                  console.log("[CONFIG] Header found. Parsing lines...");
+                }
+                continue;
+              }
+
+              // We are inside the config block now
+              if (trimmed === "") {
+                console.log("[CONFIG] Empty line detected. End of configuration block.");
+                break; // Stop parsing when we hit a blank line
+              }
+
+              // Parse "key=value"
+              const separatorIndex = trimmed.indexOf('=');
+              if (separatorIndex !== -1) {
+                const key = trimmed.substring(0, separatorIndex).trim();
+                const value = trimmed.substring(separatorIndex + 1).trim();
+                
+                config[key] = value;
+                console.log(`[CONFIG] Read property: '${key}' = '${value}'`);
+              } else {
+                console.log(`[CONFIG] Ignored line (no '=' found): "${trimmed}"`);
+              }
+            }
+
+            // Apply 'match%' if found
+            if (config['match%']) {
+              const parsedVal = parseInt(config['match%'], 10);
+              if (!isNaN(parsedVal) && parsedVal > 0 && parsedVal <= 100) {
+                similarityThreshold = parsedVal / 100;
+                console.log(`[CONFIG] APPLIED: Similarity threshold set to ${parsedVal}% (${similarityThreshold})`);
+              } else {
+                console.log(`[CONFIG] WARNING: Invalid value for 'match%' (${config['match%']}). Using default.`);
+              }
+            } else {
+              if (foundHeader) {
+                 console.log(`[CONFIG] 'match%' key not found in block. Using default: ${(similarityThreshold * 100)}%`);
+              } else {
+                 console.log(`[CONFIG] No configuration block found. Using default: ${(similarityThreshold * 100)}%`);
+              }
+            }
 
             // --- Levenshtein Distance Algorithm ---
             function levenshtein(a, b) {
@@ -50,12 +108,11 @@ jobs:
             function getSimilarity(s1, s2) {
               const longer = s1.length > s2.length ? s1 : s2;
               if (longer.length === 0) return 1.0;
-              // Note: Length optimization removed to ensure accurate matching
               const distance = levenshtein(s1, s2);
               return (longer.length - distance) / longer.length;
             }
 
-            // 1. FETCH ALL COMMENTS VIA GRAPHQL (Fixes >100 limit & 'isMinimized' missing)
+            // --- 2. FETCH ALL COMMENTS (GraphQL) ---
             console.log(`Fetching ALL comments for PR #${context.issue.number}...`);
             
             let allComments = [];
@@ -73,10 +130,10 @@ jobs:
                           endCursor
                         }
                         nodes {
-                          id             # Node ID (needed for mutation)
-                          databaseId     # Integer ID (needed for sorting)
+                          id             
+                          databaseId     
                           body
-                          isMinimized    # Explicitly fetching status
+                          isMinimized    
                           author {
                             login
                           }
@@ -99,35 +156,32 @@ jobs:
               
               hasNextPage = data.pageInfo.hasNextPage;
               endCursor = data.pageInfo.endCursor;
-              
-              if (hasNextPage) console.log("Fetching next page of comments...");
             }
 
             console.log(`[DEBUG] Successfully fetched ${allComments.length} total comments.`);
 
-            // 2. Filter Jenkins comments and sort NEWEST first
-            // We use 'databaseId' (integer) to sort because 'id' is a string hash in GraphQL
+            // --- 3. FILTER & SORT ---
             const jenkinsComments = allComments
               .filter(c => c.author && c.author.login === JENKINS_USER && c.isMinimized === false)
               .sort((a, b) => b.databaseId - a.databaseId);
 
-            console.log(`[DEBUG] Found ${jenkinsComments.length} active (un-minimized) Jenkins comments.`);
+            console.log(`[DEBUG] Found ${jenkinsComments.length} active Jenkins comments.`);
 
             if (jenkinsComments.length < 2) {
-              console.log("Not enough active comments to group.");
               return;
             }
 
-            // 3. CLUSTERING LOGIC
+            // --- 4. CLUSTERING LOGIC ---
             const groups = [];
 
             for (const comment of jenkinsComments) {
               let placedInGroup = false;
 
               for (const group of groups) {
+                // Use the DYNAMIC 'similarityThreshold' here
                 const score = getSimilarity(group.representative.body, comment.body);
                 
-                if (score >= SIMILARITY_THRESHOLD) {
+                if (score >= similarityThreshold) {
                   group.duplicates.push(comment);
                   placedInGroup = true;
                   console.log(`-> Comment ${comment.databaseId} grouped with ${group.representative.databaseId} (Similarity: ${(score*100).toFixed(2)}%)`);
@@ -144,7 +198,7 @@ jobs:
               }
             }
 
-            // 4. COLLECT TARGETS TO MINIMIZE
+            // --- 5. EXECUTE MINIMIZATION ---
             const toMinimize = [];
             for (const group of groups) {
               if (group.duplicates.length > 0) {
@@ -152,7 +206,6 @@ jobs:
               }
             }
 
-            // 5. EXECUTE MINIMIZATION
             if (toMinimize.length === 0) {
               console.log("No duplicates found to minimize.");
               return;
@@ -176,7 +229,6 @@ jobs:
                 `;
                 
                 try {
-                  // Use 'comment.id' (the Node ID IC_kw...) for the mutation
                   await github.graphql(mutation, { subjectId: comment.id });
                   console.log(`Minimized comment ${comment.databaseId}`);
                 } catch (error) {
