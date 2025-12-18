@@ -7,20 +7,21 @@ on:
 jobs:
   deduplicate:
     # Only run if the comment is from the Jenkins bot
-    # (Note: Enable this check once you are done testing manually)
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       issues: write
+      # 'issues: write' is required to delete comments
 
     steps:
-      - name: Group and Minimize Comments
+      - name: Group, Minimize, and Prune Comments
         uses: actions/github-script@v7
         with:
           script: |
             // ================= DEFAULTS =================
             const JENKINS_USER = 'KennethStubbings';
-            let similarityThreshold = 0.95; // Default strictness (95%)
+            let similarityThreshold = 0.95; 
+            let deleteAfterLimit = 0; // 0 = Disabled (Infinite history)
             const DRY_RUN = false; 
             // ============================================
 
@@ -36,68 +37,54 @@ jobs:
               const trimmed = line.trim();
 
               if (!foundHeader) {
-                // Look for the header to start the block
                 if (trimmed.includes("Jenkins Cleanup Configuration:")) {
                   foundHeader = true;
-                  console.log("[CONFIG] Header found. Parsing lines...");
                 }
                 continue;
               }
 
-              // We are inside the config block now
-              if (trimmed === "") {
-                console.log("[CONFIG] Empty line detected. End of configuration block.");
-                break; // Stop parsing when we hit a blank line
-              }
+              if (trimmed === "") break; // End of block
 
-              // Parse "key=value"
               const separatorIndex = trimmed.indexOf('=');
               if (separatorIndex !== -1) {
                 const key = trimmed.substring(0, separatorIndex).trim();
                 const value = trimmed.substring(separatorIndex + 1).trim();
-                
                 config[key] = value;
                 console.log(`[CONFIG] Read property: '${key}' = '${value}'`);
-              } else {
-                console.log(`[CONFIG] Ignored line (no '=' found): "${trimmed}"`);
               }
             }
 
-            // Apply 'match%' if found
+            // Apply 'match%'
             if (config['match%']) {
               const parsedVal = parseInt(config['match%'], 10);
               if (!isNaN(parsedVal) && parsedVal > 0 && parsedVal <= 100) {
                 similarityThreshold = parsedVal / 100;
-                console.log(`[CONFIG] APPLIED: Similarity threshold set to ${parsedVal}% (${similarityThreshold})`);
-              } else {
-                console.log(`[CONFIG] WARNING: Invalid value for 'match%' (${config['match%']}). Using default.`);
-              }
-            } else {
-              if (foundHeader) {
-                 console.log(`[CONFIG] 'match%' key not found in block. Using default: ${(similarityThreshold * 100)}%`);
-              } else {
-                 console.log(`[CONFIG] No configuration block found. Using default: ${(similarityThreshold * 100)}%`);
+                console.log(`[CONFIG] APPLIED: Similarity threshold set to ${parsedVal}%`);
               }
             }
 
-            // --- Levenshtein Distance Algorithm ---
+            // Apply 'delete-after'
+            if (config['delete-after']) {
+              const parsedLimit = parseInt(config['delete-after'], 10);
+              if (!isNaN(parsedLimit) && parsedLimit >= 0) {
+                deleteAfterLimit = parsedLimit;
+                console.log(`[CONFIG] APPLIED: Rolling History Limit. Delete comments after ${deleteAfterLimit} duplicates.`);
+              }
+            }
+
+            // --- Levenshtein Helper ---
             function levenshtein(a, b) {
               if (a.length === 0) return b.length;
               if (b.length === 0) return a.length;
               const matrix = [];
               for (let i = 0; i <= b.length; i++) matrix[i] = [i];
               for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
-
               for (let i = 1; i <= b.length; i++) {
                 for (let j = 1; j <= a.length; j++) {
                   if (b.charAt(i - 1) === a.charAt(j - 1)) {
                     matrix[i][j] = matrix[i - 1][j - 1];
                   } else {
-                    matrix[i][j] = Math.min(
-                      matrix[i - 1][j - 1] + 1,
-                      matrix[i][j - 1] + 1,
-                      matrix[i - 1][j] + 1
-                    );
+                    matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j] + 1);
                   }
                 }
               }
@@ -124,18 +111,13 @@ jobs:
                   repository(owner: $owner, name: $repo) {
                     pullRequest(number: $number) {
                       comments(first: 100, after: $cursor) {
-                        pageInfo {
-                          hasNextPage
-                          endCursor
-                        }
+                        pageInfo { hasNextPage, endCursor }
                         nodes {
                           id             
                           databaseId     
                           body
                           isMinimized    
-                          author {
-                            login
-                          }
+                          author { login }
                         }
                       }
                     }
@@ -152,86 +134,127 @@ jobs:
 
               const data = result.repository.pullRequest.comments;
               allComments = allComments.concat(data.nodes);
-              
               hasNextPage = data.pageInfo.hasNextPage;
               endCursor = data.pageInfo.endCursor;
             }
-
-            console.log(`[DEBUG] Successfully fetched ${allComments.length} total comments.`);
+            console.log(`[DEBUG] Fetched ${allComments.length} total comments.`);
 
             // --- 3. FILTER & SORT ---
+            // LOGIC CHANGE: If 'delete-after' is set, we MUST include hidden comments 
+            // to accurately count the history depth.
+            const includeHidden = (deleteAfterLimit > 0);
+
             const jenkinsComments = allComments
-              .filter(c => c.author && c.author.login === JENKINS_USER && c.isMinimized === false)
-              .sort((a, b) => b.databaseId - a.databaseId);
+              .filter(c => {
+                const isJenkins = c.author && c.author.login === JENKINS_USER;
+                if (!isJenkins) return false;
+                
+                // If we are deleting old ones, we need to see the hidden ones to count them.
+                if (includeHidden) return true;
+                
+                // Default behavior: ignore already minimized ones to save processing
+                return !c.isMinimized;
+              })
+              .sort((a, b) => b.databaseId - a.databaseId); // Newest first
 
-            console.log(`[DEBUG] Found ${jenkinsComments.length} active Jenkins comments.`);
+            console.log(`[DEBUG] Processing ${jenkinsComments.length} Jenkins comments.`);
 
-            if (jenkinsComments.length < 2) {
-              return;
-            }
+            if (jenkinsComments.length < 2) return;
 
             // --- 4. CLUSTERING LOGIC ---
             const groups = [];
 
             for (const comment of jenkinsComments) {
               let placedInGroup = false;
-
               for (const group of groups) {
-                // Use the DYNAMIC 'similarityThreshold' here
                 const score = getSimilarity(group.representative.body, comment.body);
-                
                 if (score >= similarityThreshold) {
                   group.duplicates.push(comment);
                   placedInGroup = true;
-                  console.log(`-> Comment ${comment.databaseId} grouped with ${group.representative.databaseId} (Similarity: ${(score*100).toFixed(2)}%)`);
                   break;
                 }
               }
-
               if (!placedInGroup) {
-                groups.push({
-                  representative: comment,
-                  duplicates: []
-                });
-                console.log(`-> New Group Created. Representative: ${comment.databaseId}`);
+                groups.push({ representative: comment, duplicates: [] });
               }
             }
 
-            // --- 5. EXECUTE MINIMIZATION ---
+            // --- 5. BUCKETING (MINIMIZE vs DELETE) ---
             const toMinimize = [];
+            const toDelete = [];
+
             for (const group of groups) {
-              if (group.duplicates.length > 0) {
-                toMinimize.push(...group.duplicates);
+              const dups = group.duplicates; // These are ordered Newest -> Oldest
+              
+              if (dups.length === 0) continue;
+
+              if (deleteAfterLimit > 0) {
+                // Rolling History Logic
+                // Example: Limit 5. We have 10 duplicates.
+                // Keep the first 5 (indices 0-4) as history (Minimize them).
+                // Delete the rest (indices 5-9).
+                
+                const keepAsHistory = dups.slice(0, deleteAfterLimit);
+                const garbage = dups.slice(deleteAfterLimit);
+
+                // Only add to 'toMinimize' if they aren't already minimized
+                toMinimize.push(...keepAsHistory.filter(c => !c.isMinimized));
+                
+                toDelete.push(...garbage);
+                
+                if (garbage.length > 0) {
+                  console.log(`Group ${group.representative.databaseId}: Keeping ${keepAsHistory.length} history items, deleting ${garbage.length} old items.`);
+                }
+              } else {
+                // Default Logic: Minimize everything
+                toMinimize.push(...dups.filter(c => !c.isMinimized));
               }
             }
 
-            if (toMinimize.length === 0) {
-              console.log("No duplicates found to minimize.");
-              return;
+            // --- 6. EXECUTE ACTIONS ---
+            
+            // A. DELETION
+            if (toDelete.length > 0) {
+              console.log(`\n--- DELETING ${toDelete.length} COMMENTS ---`);
+              if (!DRY_RUN) {
+                for (const comment of toDelete) {
+                  try {
+                    // Using REST API for deletion (Simpler)
+                    await github.rest.issues.deleteComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      comment_id: comment.databaseId,
+                    });
+                    console.log(`Deleted comment ${comment.databaseId}`);
+                  } catch (error) {
+                    console.error(`Error deleting ${comment.databaseId}:`, error);
+                  }
+                }
+              } else {
+                console.log(`[DRY RUN] Would delete ${toDelete.length} comments.`);
+              }
             }
 
-            console.log(`\nTotal comments to minimize: ${toMinimize.length}`);
-
-            if (DRY_RUN) {
-              console.log("DRY RUN ENABLED - No changes made.");
-            } else {
-              for (const comment of toMinimize) {
-                const mutation = `
-                  mutation($subjectId: ID!) {
-                    minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
-                      clientMutationId
-                      minimizedComment {
-                        isMinimized
+            // B. MINIMIZATION
+            if (toMinimize.length > 0) {
+              console.log(`\n--- MINIMIZING ${toMinimize.length} COMMENTS ---`);
+              if (!DRY_RUN) {
+                for (const comment of toMinimize) {
+                  const mutation = `
+                    mutation($subjectId: ID!) {
+                      minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
+                        clientMutationId
                       }
                     }
+                  `;
+                  try {
+                    await github.graphql(mutation, { subjectId: comment.id });
+                    console.log(`Minimized comment ${comment.databaseId}`);
+                  } catch (error) {
+                    console.error(`Error minimizing ${comment.databaseId}:`, error);
                   }
-                `;
-                
-                try {
-                  await github.graphql(mutation, { subjectId: comment.id });
-                  console.log(`Minimized comment ${comment.databaseId}`);
-                } catch (error) {
-                  console.error(`Error minimizing ${comment.databaseId}:`, error);
                 }
+              } else {
+                console.log(`[DRY RUN] Would minimize ${toMinimize.length} comments.`);
               }
             }
