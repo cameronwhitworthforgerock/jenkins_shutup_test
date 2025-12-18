@@ -4,6 +4,12 @@ on:
   issue_comment:
     types: [created]
 
+# CRITICAL: Prevents race conditions when updating the PR Description.
+# If Jenkins posts 3 comments at once, this ensures we only run one Cleanup/Update at a time.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
 jobs:
   deduplicate:
     runs-on: ubuntu-latest
@@ -16,44 +22,82 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // ================= DEFAULTS =================
-            const JENKINS_USER = 'KennethStubbings'; 
-            let similarityThreshold = 0.80; 
-            // ============================================
+            // ================= CONFIGURATION =================
+            const JENKINS_USER = 'KennethStubbings';
+            
+            // These defaults will be injected into the PR if config is missing
+            const DEFAULT_CONFIG = {
+              "match_threshold": 80,
+              "disable": false
+            };
+            // =================================================
 
-            // --- 1. CONFIGURATION PARSING ---
-            const prBody = context.payload.issue.body || "";
-            const lines = prBody.split(/\r?\n/);
-            let foundHeader = false;
-            const config = {};
+            // --- 1. CONFIGURATION MANAGEMENT ---
+            
+            async function getOrInitConfig() {
+              const prBody = context.payload.issue.body || "";
+              
+              // Regex: Looks for the Header, then optionally some text, then a JSON code block
+              // Capture Group 1 is the JSON content inside the curly braces
+              const jsonRegex = /###\s*Jenkins Cleanup Configuration[\s\S]*?```json\s*(\{[\s\S]*?\})\s*```/i;
+              const match = prBody.match(jsonRegex);
 
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!foundHeader) {
-                if (trimmed.includes("Jenkins Cleanup Configuration:")) foundHeader = true;
-                continue;
+              if (match && match[1]) {
+                try {
+                  const parsed = JSON.parse(match[1]);
+                  console.log("[CONFIG] Found and parsed JSON configuration.");
+                  return { ...DEFAULT_CONFIG, ...parsed }; // Merge with defaults for safety
+                } catch (e) {
+                  console.log("[CONFIG] JSON block found but invalid. Using defaults.");
+                  console.error(e);
+                  return DEFAULT_CONFIG;
+                }
               }
-              if (trimmed === "") break; 
 
-              const separatorIndex = trimmed.indexOf('=');
-              if (separatorIndex !== -1) {
-                const key = trimmed.substring(0, separatorIndex).trim().toLowerCase();
-                const value = trimmed.substring(separatorIndex + 1).trim();
-                config[key] = value;
+              // --- AUTO-INITIALIZATION LOGIC ---
+              console.log("[CONFIG] No configuration found. Injecting defaults into PR description...");
+              
+              const newConfigBlock = [
+                "",
+                "---",
+                "### Jenkins Cleanup Configuration",
+                "",
+                "```json",
+                JSON.stringify(DEFAULT_CONFIG, null, 2),
+                "```"
+              ].join("\n");
+
+              try {
+                // Update the PR body
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: prBody + newConfigBlock
+                });
+                console.log("[CONFIG] Defaults injected successfully.");
+              } catch (err) {
+                console.error("[CONFIG] Failed to update PR description:", err);
               }
+
+              return DEFAULT_CONFIG;
             }
 
-            if (config['disable'] === 'true') {
-              console.log("[CONFIG] 'disable=true' found. Skipping cleanup script.");
+            // LOAD CONFIGURATION
+            const config = await getOrInitConfig();
+
+            // CHECK: DISABLE
+            if (config.disable) {
+              console.log("[CONFIG] 'disable': true. Skipping cleanup.");
               return;
             }
 
-            if (config['match%']) {
-              const parsedVal = parseInt(config['match%'], 10);
-              if (!isNaN(parsedVal) && parsedVal > 0 && parsedVal <= 100) {
-                similarityThreshold = parsedVal / 100;
-                console.log(`[CONFIG] APPLIED: Similarity threshold set to ${parsedVal}%`);
-              }
+            // SET THRESHOLD
+            // Convert integer (80) to float (0.80) for math
+            let similarityThreshold = 0.95; 
+            if (config.match_threshold) {
+              similarityThreshold = config.match_threshold / 100;
+              console.log(`[CONFIG] Similarity Threshold: ${similarityThreshold} (${config.match_threshold}%)`);
             }
 
             // --- Levenshtein Helper ---
@@ -154,8 +198,6 @@ jobs:
             console.log(`Minimizing ${toMinimize.length} comments...`);
 
             for (const comment of toMinimize) {
-              // ACTION: We strictly use OUTDATED here to try and match the UI.
-              // VERIFICATION: We request 'minimizedReason' to confirm the API worked.
               const mutation = `
                 mutation($subjectId: ID!) {
                   minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
@@ -169,7 +211,7 @@ jobs:
               try {
                 const response = await github.graphql(mutation, { subjectId: comment.id });
                 const reason = response.minimizeComment.minimizedComment.minimizedReason;
-                console.log(`Minimized comment ${comment.databaseId} (API confirmed reason: ${reason})`);
+                console.log(`Minimized comment ${comment.databaseId} (Reason: ${reason})`);
               } catch (error) {
                 console.error(`Error minimizing ${comment.databaseId}:`, error);
               }
