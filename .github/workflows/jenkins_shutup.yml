@@ -7,8 +7,6 @@ on:
 jobs:
   deduplicate:
     # Only run if the comment is from the Jenkins bot
-    # (Note: Enable this check once you are done testing manually)
-    if: github.event.comment.user.login == 'KennethStubbings'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
