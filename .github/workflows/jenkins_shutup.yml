@@ -1,18 +1,17 @@
-name: Jenkins Comment Janitor
+name: Jenkins Shutup
 
 on:
-  pull_request:
-    # 'synchronize' triggers on new commits pushed to the PR
-    # 'opened' triggers when the PR is first created
-    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
 
-# Concurrency: Ensures only one janitor runs at a time per PR
+# Concurrency is vital here to prevent race conditions when updating the config
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.issue.number }}
   cancel-in-progress: false
 
 jobs:
   deduplicate:
+    if: github.event.comment.user.login == jenkins-ping
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -24,16 +23,16 @@ jobs:
         with:
           script: |
             // ================= CONFIGURATION =================
-            const JENKINS_USER = 'KennethStubbings';
+            const JENKINS_USER = 'jenkins-ping';
             
             const DEFAULT_CONFIG = {
               "match_threshold": 80,
-              "enabled": true,
+              "disable": false,
               "do_unhide_comments": false
             };
             // =================================================
 
-            // --- HELPER: Fetch latest PR Body ---
+            // --- HELPER: Fetch latest PR Body (Vital for config updates) ---
             async function getLatestPrBody() {
               const { data: pr } = await github.rest.issues.get({
                 owner: context.repo.owner,
@@ -45,11 +44,18 @@ jobs:
 
             // --- HELPER: Update Config in PR Description ---
             async function writeConfigBack(currentBody, newConfig) {
+              // Regex to find the JSON block again
               const jsonBlockRegex = /(###\s*Jenkins Cleanup Configuration[\s\S]*?```json\s*)([\s\S]*?)(\s*```)/i;
+              
               const newJson = JSON.stringify(newConfig, null, 2);
+              
+              // Replace ONLY the JSON part (keeping headers/comments intact)
               const newBody = currentBody.replace(jsonBlockRegex, `$1${newJson}$3`);
 
-              if (newBody === currentBody) return;
+              if (newBody === currentBody) {
+                console.log("[CONFIG] No changes detected in body, skipping write.");
+                return;
+              }
 
               await github.rest.issues.update({
                 owner: context.repo.owner,
@@ -57,13 +63,13 @@ jobs:
                 issue_number: context.issue.number,
                 body: newBody
               });
-              console.log("[CONFIG] Updated PR description: 'do_unhide_comments' reset to false.");
+              console.log("[CONFIG] Updated PR description successfully.");
             }
 
-            // --- 1. CONFIGURATION LOADING ---
+            // --- 1. CONFIGURATION MANAGEMENT ---
             let prBody = await getLatestPrBody();
             
-            // Regex to find existing config block
+            // Regex to parse the config
             const jsonRegex = /###\s*Jenkins Cleanup Configuration[\s\S]*?```json\s*(\{[\s\S]*?\})\s*```/i;
             const match = prBody.match(jsonRegex);
             
@@ -80,7 +86,7 @@ jobs:
                 console.log("[CONFIG] Invalid JSON found. Using defaults.");
               }
             } else {
-              // INJECT DEFAULTS
+              // INJECT DEFAULTS if missing
               console.log("[CONFIG] No configuration found. Injecting defaults...");
               let padding = "\n\n";
               if (prBody.endsWith("\n\n")) padding = "";
@@ -102,6 +108,7 @@ jobs:
                   issue_number: context.issue.number,
                   body: prBody + padding + newConfigBlock
                 });
+                // Update local var so we don't have to refetch
                 prBody = prBody + padding + newConfigBlock; 
                 configFound = true;
               } catch (err) {
@@ -109,14 +116,8 @@ jobs:
               }
             }
 
-            // --- 2. EARLY EXIT CHECK ---
-            // If enabled is false AND we are not trying to unhide, stop here.
-            if (config.enabled === false && config.do_unhide_comments !== true) {
-              console.log("[CONFIG] Action is disabled and no unhide operation requested. Exiting.");
-              return;
-            }
-
-            // --- 3. FETCH ALL COMMENTS (GraphQL) ---
+            // --- 2. FETCH ALL COMMENTS (GraphQL) ---
+            // We fetch ALL comments once, to be used by either the Unhide logic or Cleanup logic
             console.log(`Fetching comments for PR #${context.issue.number}...`);
             let allComments = [];
             let hasNextPage = true;
@@ -149,16 +150,18 @@ jobs:
               endCursor = data.pageInfo.endCursor;
             }
 
-            // --- 4. SPECIAL MODE: UNHIDE ALL ---
+            // --- 3. SPECIAL MODE: UNHIDE ALL ---
             if (config.do_unhide_comments === true) {
-              console.log("!!! SPECIAL MODE: UNHIDING ALL JENKINS COMMENTS !!!");
+              console.log("!!! SPECIAL MODE DETECTED: UNHIDING ALL JENKINS COMMENTS !!!");
               
+              // Filter: Jenkins User AND Currently Minimized
               const hiddenJenkinsComments = allComments.filter(c => 
                 c.author && c.author.login === JENKINS_USER && c.isMinimized
               );
 
               if (hiddenJenkinsComments.length > 0) {
                 console.log(`Found ${hiddenJenkinsComments.length} hidden comments to restore.`);
+                
                 for (const comment of hiddenJenkinsComments) {
                   const mutation = `
                     mutation($subjectId: ID!) {
@@ -179,18 +182,24 @@ jobs:
               }
 
               // AUTO-RESET CONFIG
+              console.log("[CONFIG] Resetting 'do_unhide_comments' to false...");
               config.do_unhide_comments = false;
-              const latestBody = await getLatestPrBody(); 
-              await writeConfigBack(latestBody, config);
               
-              return; // EXIT SCRIPT
+              // We use the helper to write the 'false' value back to the PR description
+              await writeConfigBack(prBody, config);
+              
+              return; // EXIT SCRIPT AFTER UNHIDING
+            }
+
+            // --- 4. CHECK DISABLE ---
+            // We check this AFTER the unhide logic, so you can unhide even if 'disable' is true
+            if (config.disable) {
+              console.log("[CONFIG] 'disable': true. Skipping cleanup.");
+              return;
             }
 
             // --- 5. STANDARD CLEANUP LOGIC ---
             
-            // Double check enabled (redundant but safe)
-            if (config.enabled === false) return;
-
             let similarityThreshold = 0.95; 
             if (config.match_threshold) {
               similarityThreshold = config.match_threshold / 100;
@@ -223,7 +232,7 @@ jobs:
               return (longer.length - distance) / longer.length;
             }
 
-            // Filter & Sort
+            // Filter & Sort (Ignore minimized ones for standard cleanup)
             const jenkinsComments = allComments
               .filter(c => c.author && c.author.login === JENKINS_USER && !c.isMinimized)
               .sort((a, b) => b.databaseId - a.databaseId);
@@ -247,7 +256,7 @@ jobs:
               }
             }
 
-            // Minimize Execution
+            // Collect to Minimize
             const toMinimize = [];
             for (const group of groups) {
               if (group.duplicates.length > 0) {
@@ -262,6 +271,7 @@ jobs:
 
             console.log(`Minimizing ${toMinimize.length} comments...`);
 
+            // Minimize Execution
             for (const comment of toMinimize) {
               const mutation = `
                 mutation($subjectId: ID!) {
