@@ -1,8 +1,10 @@
 name: Jenkins Comment Janitor
 
 on:
-  issue_comment:
-    types: [created]
+  pull_request:
+    # 'synchronize' triggers on new commits pushed to the PR
+    # 'opened' triggers when the PR is first created
+    types: [opened, synchronize]
 
 # Concurrency: Ensures only one janitor runs at a time per PR
 concurrency:
