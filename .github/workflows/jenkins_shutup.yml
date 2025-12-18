@@ -4,7 +4,7 @@ on:
   issue_comment:
     types: [created]
 
-# CRITICAL: Prevents race conditions.
+# Concurrency is vital here to prevent race conditions when updating the config
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.issue.number }}
   cancel-in-progress: false
@@ -17,7 +17,7 @@ jobs:
       issues: write
 
     steps:
-      - name: Group and Minimize Comments
+      - name: Jenkins Janitor
         uses: actions/github-script@v7
         with:
           script: |
@@ -26,41 +26,70 @@ jobs:
             
             const DEFAULT_CONFIG = {
               "match_threshold": 80,
-              "disable": false
+              "disable": false,
+              "do_unhide_comments": false
             };
             // =================================================
 
+            // --- HELPER: Fetch latest PR Body (Vital for config updates) ---
+            async function getLatestPrBody() {
+              const { data: pr } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+              return pr.body || "";
+            }
+
+            // --- HELPER: Update Config in PR Description ---
+            async function writeConfigBack(currentBody, newConfig) {
+              // Regex to find the JSON block again
+              const jsonBlockRegex = /(###\s*Jenkins Cleanup Configuration[\s\S]*?```json\s*)([\s\S]*?)(\s*```)/i;
+              
+              const newJson = JSON.stringify(newConfig, null, 2);
+              
+              // Replace ONLY the JSON part (keeping headers/comments intact)
+              const newBody = currentBody.replace(jsonBlockRegex, `$1${newJson}$3`);
+
+              if (newBody === currentBody) {
+                console.log("[CONFIG] No changes detected in body, skipping write.");
+                return;
+              }
+
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: newBody
+              });
+              console.log("[CONFIG] Updated PR description successfully.");
+            }
+
             // --- 1. CONFIGURATION MANAGEMENT ---
+            let prBody = await getLatestPrBody();
             
-            async function getOrInitConfig() {
-              const prBody = context.payload.issue.body || "";
-              
-              // Regex: Looks for JSON block
-              const jsonRegex = /###\s*Jenkins Cleanup Configuration[\s\S]*?```json\s*(\{[\s\S]*?\})\s*```/i;
-              const match = prBody.match(jsonRegex);
+            // Regex to parse the config
+            const jsonRegex = /###\s*Jenkins Cleanup Configuration[\s\S]*?```json\s*(\{[\s\S]*?\})\s*```/i;
+            const match = prBody.match(jsonRegex);
+            
+            let config = { ...DEFAULT_CONFIG };
+            let configFound = false;
 
-              if (match && match[1]) {
-                try {
-                  const parsed = JSON.parse(match[1]);
-                  console.log("[CONFIG] Found and parsed JSON configuration.");
-                  return { ...DEFAULT_CONFIG, ...parsed }; 
-                } catch (e) {
-                  console.log("[CONFIG] JSON block found but invalid. Using defaults.");
-                  return DEFAULT_CONFIG;
-                }
+            if (match && match[1]) {
+              try {
+                const parsed = JSON.parse(match[1]);
+                config = { ...DEFAULT_CONFIG, ...parsed };
+                configFound = true;
+                console.log("[CONFIG] Configuration loaded.");
+              } catch (e) {
+                console.log("[CONFIG] Invalid JSON found. Using defaults.");
               }
-
-              // --- AUTO-INITIALIZATION LOGIC ---
+            } else {
+              // INJECT DEFAULTS if missing
               console.log("[CONFIG] No configuration found. Injecting defaults...");
-              
-              // FIX: Ensure we have a blank line before "---" to prevent
-              // Markdown from turning the previous line into a Header 2.
               let padding = "\n\n";
-              if (prBody.endsWith("\n\n")) {
-                padding = ""; 
-              } else if (prBody.endsWith("\n")) {
-                padding = "\n";
-              }
+              if (prBody.endsWith("\n\n")) padding = "";
+              else if (prBody.endsWith("\n")) padding = "\n";
 
               const newConfigBlock = [
                 "---",
@@ -78,57 +107,17 @@ jobs:
                   issue_number: context.issue.number,
                   body: prBody + padding + newConfigBlock
                 });
-                console.log("[CONFIG] Defaults injected successfully.");
+                // Update local var so we don't have to refetch
+                prBody = prBody + padding + newConfigBlock; 
+                configFound = true;
               } catch (err) {
-                console.error("[CONFIG] Failed to update PR description:", err);
+                console.error("[CONFIG] Failed to inject defaults:", err);
               }
-
-              return DEFAULT_CONFIG;
-            }
-
-            // LOAD CONFIGURATION
-            const config = await getOrInitConfig();
-
-            // CHECK: DISABLE
-            if (config.disable) {
-              console.log("[CONFIG] 'disable': true. Skipping cleanup.");
-              return;
-            }
-
-            // SET THRESHOLD
-            let similarityThreshold = 0.95; 
-            if (config.match_threshold) {
-              similarityThreshold = config.match_threshold / 100;
-              console.log(`[CONFIG] Similarity Threshold: ${similarityThreshold} (${config.match_threshold}%)`);
-            }
-
-            // --- Levenshtein Helper ---
-            function levenshtein(a, b) {
-              if (a.length === 0) return b.length;
-              if (b.length === 0) return a.length;
-              const matrix = [];
-              for (let i = 0; i <= b.length; i++) matrix[i] = [i];
-              for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
-              for (let i = 1; i <= b.length; i++) {
-                for (let j = 1; j <= a.length; j++) {
-                  if (b.charAt(i - 1) === a.charAt(j - 1)) {
-                    matrix[i][j] = matrix[i - 1][j - 1];
-                  } else {
-                    matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j] + 1);
-                  }
-                }
-              }
-              return matrix[b.length][a.length];
-            }
-
-            function getSimilarity(s1, s2) {
-              const longer = s1.length > s2.length ? s1 : s2;
-              if (longer.length === 0) return 1.0;
-              const distance = levenshtein(s1, s2);
-              return (longer.length - distance) / longer.length;
             }
 
             // --- 2. FETCH ALL COMMENTS (GraphQL) ---
+            // We fetch ALL comments once, to be used by either the Unhide logic or Cleanup logic
+            console.log(`Fetching comments for PR #${context.issue.number}...`);
             let allComments = [];
             let hasNextPage = true;
             let endCursor = null;
@@ -160,14 +149,96 @@ jobs:
               endCursor = data.pageInfo.endCursor;
             }
 
-            // --- 3. FILTER & SORT ---
+            // --- 3. SPECIAL MODE: UNHIDE ALL ---
+            if (config.do_unhide_comments === true) {
+              console.log("!!! SPECIAL MODE DETECTED: UNHIDING ALL JENKINS COMMENTS !!!");
+              
+              // Filter: Jenkins User AND Currently Minimized
+              const hiddenJenkinsComments = allComments.filter(c => 
+                c.author && c.author.login === JENKINS_USER && c.isMinimized
+              );
+
+              if (hiddenJenkinsComments.length > 0) {
+                console.log(`Found ${hiddenJenkinsComments.length} hidden comments to restore.`);
+                
+                for (const comment of hiddenJenkinsComments) {
+                  const mutation = `
+                    mutation($subjectId: ID!) {
+                      unminimizeComment(input: { subjectId: $subjectId }) {
+                        unminimizedComment { isMinimized }
+                      }
+                    }
+                  `;
+                  try {
+                    await github.graphql(mutation, { subjectId: comment.id });
+                    console.log(`Restored comment ${comment.databaseId}`);
+                  } catch (err) {
+                    console.error(`Failed to restore ${comment.databaseId}`, err);
+                  }
+                }
+              } else {
+                console.log("No hidden Jenkins comments found.");
+              }
+
+              // AUTO-RESET CONFIG
+              console.log("[CONFIG] Resetting 'do_unhide_comments' to false...");
+              config.do_unhide_comments = false;
+              
+              // We use the helper to write the 'false' value back to the PR description
+              await writeConfigBack(prBody, config);
+              
+              return; // EXIT SCRIPT AFTER UNHIDING
+            }
+
+            // --- 4. CHECK DISABLE ---
+            // We check this AFTER the unhide logic, so you can unhide even if 'disable' is true
+            if (config.disable) {
+              console.log("[CONFIG] 'disable': true. Skipping cleanup.");
+              return;
+            }
+
+            // --- 5. STANDARD CLEANUP LOGIC ---
+            
+            let similarityThreshold = 0.95; 
+            if (config.match_threshold) {
+              similarityThreshold = config.match_threshold / 100;
+              console.log(`[CONFIG] Similarity Threshold: ${similarityThreshold} (${config.match_threshold}%)`);
+            }
+
+            // Levenshtein Helper
+            function levenshtein(a, b) {
+              if (a.length === 0) return b.length;
+              if (b.length === 0) return a.length;
+              const matrix = [];
+              for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+              for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+              for (let i = 1; i <= b.length; i++) {
+                for (let j = 1; j <= a.length; j++) {
+                  if (b.charAt(i - 1) === a.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                  } else {
+                    matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j] + 1);
+                  }
+                }
+              }
+              return matrix[b.length][a.length];
+            }
+
+            function getSimilarity(s1, s2) {
+              const longer = s1.length > s2.length ? s1 : s2;
+              if (longer.length === 0) return 1.0;
+              const distance = levenshtein(s1, s2);
+              return (longer.length - distance) / longer.length;
+            }
+
+            // Filter & Sort (Ignore minimized ones for standard cleanup)
             const jenkinsComments = allComments
               .filter(c => c.author && c.author.login === JENKINS_USER && !c.isMinimized)
               .sort((a, b) => b.databaseId - a.databaseId);
 
             if (jenkinsComments.length < 2) return;
 
-            // --- 4. CLUSTERING LOGIC ---
+            // Clustering
             const groups = [];
             for (const comment of jenkinsComments) {
               let placedInGroup = false;
@@ -184,7 +255,7 @@ jobs:
               }
             }
 
-            // --- 5. MINIMIZE EXECUTION ---
+            // Collect to Minimize
             const toMinimize = [];
             for (const group of groups) {
               if (group.duplicates.length > 0) {
@@ -199,21 +270,18 @@ jobs:
 
             console.log(`Minimizing ${toMinimize.length} comments...`);
 
+            // Minimize Execution
             for (const comment of toMinimize) {
               const mutation = `
                 mutation($subjectId: ID!) {
                   minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
-                    minimizedComment {
-                      isMinimized
-                      minimizedReason
-                    }
+                    minimizedComment { isMinimized, minimizedReason }
                   }
                 }
               `;
               try {
                 const response = await github.graphql(mutation, { subjectId: comment.id });
-                const reason = response.minimizeComment.minimizedComment.minimizedReason;
-                console.log(`Minimized comment ${comment.databaseId} (Reason: ${reason})`);
+                console.log(`Minimized comment ${comment.databaseId}`);
               } catch (error) {
                 console.error(`Error minimizing ${comment.databaseId}:`, error);
               }
