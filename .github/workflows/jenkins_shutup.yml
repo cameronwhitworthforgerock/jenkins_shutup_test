@@ -4,8 +4,7 @@ on:
   issue_comment:
     types: [created]
 
-# CRITICAL: Prevents race conditions when updating the PR Description.
-# If Jenkins posts 3 comments at once, this ensures we only run one Cleanup/Update at a time.
+# CRITICAL: Prevents race conditions.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.issue.number }}
   cancel-in-progress: false
@@ -25,7 +24,6 @@ jobs:
             // ================= CONFIGURATION =================
             const JENKINS_USER = 'KennethStubbings';
             
-            // These defaults will be injected into the PR if config is missing
             const DEFAULT_CONFIG = {
               "match_threshold": 80,
               "disable": false
@@ -37,8 +35,7 @@ jobs:
             async function getOrInitConfig() {
               const prBody = context.payload.issue.body || "";
               
-              // Regex: Looks for the Header, then optionally some text, then a JSON code block
-              // Capture Group 1 is the JSON content inside the curly braces
+              // Regex: Looks for JSON block
               const jsonRegex = /###\s*Jenkins Cleanup Configuration[\s\S]*?```json\s*(\{[\s\S]*?\})\s*```/i;
               const match = prBody.match(jsonRegex);
 
@@ -46,19 +43,26 @@ jobs:
                 try {
                   const parsed = JSON.parse(match[1]);
                   console.log("[CONFIG] Found and parsed JSON configuration.");
-                  return { ...DEFAULT_CONFIG, ...parsed }; // Merge with defaults for safety
+                  return { ...DEFAULT_CONFIG, ...parsed }; 
                 } catch (e) {
                   console.log("[CONFIG] JSON block found but invalid. Using defaults.");
-                  console.error(e);
                   return DEFAULT_CONFIG;
                 }
               }
 
               // --- AUTO-INITIALIZATION LOGIC ---
-              console.log("[CONFIG] No configuration found. Injecting defaults into PR description...");
+              console.log("[CONFIG] No configuration found. Injecting defaults...");
               
+              // FIX: Ensure we have a blank line before "---" to prevent
+              // Markdown from turning the previous line into a Header 2.
+              let padding = "\n\n";
+              if (prBody.endsWith("\n\n")) {
+                padding = ""; 
+              } else if (prBody.endsWith("\n")) {
+                padding = "\n";
+              }
+
               const newConfigBlock = [
-                "",
                 "---",
                 "### Jenkins Cleanup Configuration",
                 "",
@@ -68,12 +72,11 @@ jobs:
               ].join("\n");
 
               try {
-                // Update the PR body
                 await github.rest.issues.update({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: context.issue.number,
-                  body: prBody + newConfigBlock
+                  body: prBody + padding + newConfigBlock
                 });
                 console.log("[CONFIG] Defaults injected successfully.");
               } catch (err) {
@@ -93,7 +96,6 @@ jobs:
             }
 
             // SET THRESHOLD
-            // Convert integer (80) to float (0.80) for math
             let similarityThreshold = 0.95; 
             if (config.match_threshold) {
               similarityThreshold = config.match_threshold / 100;
