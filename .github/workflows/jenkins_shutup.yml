@@ -6,7 +6,6 @@ on:
 
 jobs:
   deduplicate:
-    # Update this to your actual Jenkins user
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -44,13 +43,11 @@ jobs:
               }
             }
 
-            // CHECK: DISABLE
             if (config['disable'] === 'true') {
               console.log("[CONFIG] 'disable=true' found. Skipping cleanup script.");
               return;
             }
 
-            // CHECK: MATCH%
             if (config['match%']) {
               const parsedVal = parseInt(config['match%'], 10);
               if (!isNaN(parsedVal) && parsedVal > 0 && parsedVal <= 100) {
@@ -71,11 +68,7 @@ jobs:
                   if (b.charAt(i - 1) === a.charAt(j - 1)) {
                     matrix[i][j] = matrix[i - 1][j - 1];
                   } else {
-                    matrix[i][j] = Math.min(
-                      matrix[i - 1][j - 1] + 1,
-                      matrix[i][j - 1] + 1,
-                      matrix[i - 1][j] + 1
-                    );
+                    matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j] + 1);
                   }
                 }
               }
@@ -90,8 +83,6 @@ jobs:
             }
 
             // --- 2. FETCH ALL COMMENTS (GraphQL) ---
-            console.log(`Fetching ALL comments for PR #${context.issue.number}...`);
-            
             let allComments = [];
             let hasNextPage = true;
             let endCursor = null;
@@ -102,18 +93,9 @@ jobs:
                   repository(owner: $owner, name: $repo) {
                     pullRequest(number: $number) {
                       comments(first: 100, after: $cursor) {
-                        pageInfo {
-                          hasNextPage
-                          endCursor
-                        }
+                        pageInfo { hasNextPage, endCursor }
                         nodes {
-                          id             # Node ID (needed for mutation)
-                          databaseId     # Integer ID (needed for sorting)
-                          body
-                          isMinimized    # Explicitly fetching status
-                          author {
-                            login
-                          }
+                          id, databaseId, body, isMinimized, author { login }
                         }
                       }
                     }
@@ -132,11 +114,7 @@ jobs:
               endCursor = data.pageInfo.endCursor;
             }
 
-            console.log(`[DEBUG] Successfully fetched ${allComments.length} total comments.`);
-
             // --- 3. FILTER & SORT ---
-            // We ignore minimized comments here to save processing time
-            // Since we are NOT deleting, we don't need to count the hidden history
             const jenkinsComments = allComments
               .filter(c => c.author && c.author.login === JENKINS_USER && !c.isMinimized)
               .sort((a, b) => b.databaseId - a.databaseId);
@@ -176,16 +154,22 @@ jobs:
             console.log(`Minimizing ${toMinimize.length} comments...`);
 
             for (const comment of toMinimize) {
+              // ACTION: We strictly use OUTDATED here to try and match the UI.
+              // VERIFICATION: We request 'minimizedReason' to confirm the API worked.
               const mutation = `
                 mutation($subjectId: ID!) {
                   minimizeComment(input: { subjectId: $subjectId, classifier: OUTDATED }) {
-                    clientMutationId
+                    minimizedComment {
+                      isMinimized
+                      minimizedReason
+                    }
                   }
                 }
               `;
               try {
-                await github.graphql(mutation, { subjectId: comment.id });
-                console.log(`Minimized comment ${comment.databaseId}`);
+                const response = await github.graphql(mutation, { subjectId: comment.id });
+                const reason = response.minimizeComment.minimizedComment.minimizedReason;
+                console.log(`Minimized comment ${comment.databaseId} (API confirmed reason: ${reason})`);
               } catch (error) {
                 console.error(`Error minimizing ${comment.databaseId}:`, error);
               }
