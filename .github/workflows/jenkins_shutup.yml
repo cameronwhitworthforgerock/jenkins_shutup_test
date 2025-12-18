@@ -7,8 +7,8 @@ on:
 jobs:
   deduplicate:
     # Only run if the comment is from the Jenkins bot
-    # (Note: You might want to remove this 'if' temporarily if testing with your own user)
-    # if: github.event.comment.user.login == 'KennethStubbings'
+    # (Note: Enable this check once you are done testing manually)
+    if: github.event.comment.user.login == 'KennethStubbings'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -22,8 +22,6 @@ jobs:
             // ================= CONFIGURATION =================
             const JENKINS_USER = 'KennethStubbings';
             const SIMILARITY_THRESHOLD = 0.80; 
-            
-            // SET THIS TO TRUE TO TEST WITHOUT HIDING COMMENTS
             const DRY_RUN = false; 
             // =================================================
 
@@ -31,7 +29,6 @@ jobs:
             function levenshtein(a, b) {
               if (a.length === 0) return b.length;
               if (b.length === 0) return a.length;
-              
               const matrix = [];
               for (let i = 0; i <= b.length; i++) matrix[i] = [i];
               for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
@@ -52,54 +49,74 @@ jobs:
               return matrix[b.length][a.length];
             }
 
-            function getSimilarity(s1, s2, id1, id2) {
+            function getSimilarity(s1, s2) {
               const longer = s1.length > s2.length ? s1 : s2;
               if (longer.length === 0) return 1.0;
-              
-              const lenDiff = Math.abs(s1.length - s2.length);
-              const maxAllowedDiff = longer.length * (1 - SIMILARITY_THRESHOLD);
-
-              // LOGGING: Check if length optimization is triggering
-              if (lenDiff > maxAllowedDiff) {
-                console.log(`[DEBUG] Skipped comparison between ${id1} and ${id2}.`);
-                console.log(`       Reason: Length diff (${lenDiff}) > Allowed (${maxAllowedDiff.toFixed(2)}). Threshold is strict.`);
-                return 0; 
-              }
-
+              // Note: Length optimization removed to ensure accurate matching
               const distance = levenshtein(s1, s2);
-              const score = (longer.length - distance) / longer.length;
-              return score;
+              return (longer.length - distance) / longer.length;
             }
 
-            // 1. Fetch comments
-            // Note: We added 'per_page: 100' to try and get more comments, 
-            // as the default is often only 30.
-            console.log(`Fetching comments for PR #${context.issue.number}...`);
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              per_page: 100, // Ask for max per page to reduce number of API calls
-            });
+            // 1. FETCH ALL COMMENTS VIA GRAPHQL (Fixes >100 limit & 'isMinimized' missing)
+            console.log(`Fetching ALL comments for PR #${context.issue.number}...`);
+            
+            let allComments = [];
+            let hasNextPage = true;
+            let endCursor = null;
 
-            console.log(`[DEBUG] Raw API returned ${comments.length} comments.`);
+            while (hasNextPage) {
+              const query = `
+                query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      comments(first: 100, after: $cursor) {
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                        nodes {
+                          id             # Node ID (needed for mutation)
+                          databaseId     # Integer ID (needed for sorting)
+                          body
+                          isMinimized    # Explicitly fetching status
+                          author {
+                            login
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+
+              const result = await github.graphql(query, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: context.issue.number,
+                cursor: endCursor
+              });
+
+              const data = result.repository.pullRequest.comments;
+              allComments = allComments.concat(data.nodes);
+              
+              hasNextPage = data.pageInfo.hasNextPage;
+              endCursor = data.pageInfo.endCursor;
+              
+              if (hasNextPage) console.log("Fetching next page of comments...");
+            }
+
+            console.log(`[DEBUG] Successfully fetched ${allComments.length} total comments.`);
 
             // 2. Filter Jenkins comments and sort NEWEST first
-            const jenkinsComments = comments
-              .filter(c => {
-                 const isTargetUser = c.user.login === JENKINS_USER;
-                 // Debug if 'is_minimized' is actually present
-                 if (isTargetUser && c.is_minimized === undefined) {
-                    console.log(`[WARNING] Comment ${c.id} has undefined 'is_minimized' property! REST API might not be returning it.`);
-                 }
-                 return isTargetUser && !c.is_minimized;
-              })
-              .sort((a, b) => b.id - a.id);
-            
-            console.log(`[DEBUG] After filtering for user '${JENKINS_USER}' and !minimized: ${jenkinsComments.length} comments remain.`);
+            // We use 'databaseId' (integer) to sort because 'id' is a string hash in GraphQL
+            const jenkinsComments = allComments
+              .filter(c => c.author && c.author.login === JENKINS_USER && c.isMinimized === false)
+              .sort((a, b) => b.databaseId - a.databaseId);
+
+            console.log(`[DEBUG] Found ${jenkinsComments.length} active (un-minimized) Jenkins comments.`);
 
             if (jenkinsComments.length < 2) {
-              console.log("Not enough comments to group.");
+              console.log("Not enough active comments to group.");
               return;
             }
 
@@ -109,18 +126,14 @@ jobs:
             for (const comment of jenkinsComments) {
               let placedInGroup = false;
 
-              // Check if this comment belongs to an existing group
               for (const group of groups) {
-                // Pass IDs to helper for better logging
-                const score = getSimilarity(group.representative.body, comment.body, group.representative.id, comment.id);
+                const score = getSimilarity(group.representative.body, comment.body);
                 
                 if (score >= SIMILARITY_THRESHOLD) {
                   group.duplicates.push(comment);
                   placedInGroup = true;
-                  console.log(`-> Comment ${comment.id} grouped with ${group.representative.id} (Similarity: ${(score*100).toFixed(2)}%)`);
+                  console.log(`-> Comment ${comment.databaseId} grouped with ${group.representative.databaseId} (Similarity: ${(score*100).toFixed(2)}%)`);
                   break;
-                } else {
-                   console.log(`[DEBUG] No match: ${comment.id} vs ${group.representative.id} was only ${(score*100).toFixed(2)}%`);
                 }
               }
 
@@ -129,7 +142,7 @@ jobs:
                   representative: comment,
                   duplicates: []
                 });
-                console.log(`-> New Group Created. Representative: ${comment.id}`);
+                console.log(`-> New Group Created. Representative: ${comment.databaseId}`);
               }
             }
 
@@ -137,7 +150,6 @@ jobs:
             const toMinimize = [];
             for (const group of groups) {
               if (group.duplicates.length > 0) {
-                console.log(`Group ${group.representative.id} has ${group.duplicates.length} outdated duplicates.`);
                 toMinimize.push(...group.duplicates);
               }
             }
@@ -166,10 +178,11 @@ jobs:
                 `;
                 
                 try {
-                  await github.graphql(mutation, { subjectId: comment.node_id });
-                  console.log(`Minimized comment ${comment.id}`);
+                  // Use 'comment.id' (the Node ID IC_kw...) for the mutation
+                  await github.graphql(mutation, { subjectId: comment.id });
+                  console.log(`Minimized comment ${comment.databaseId}`);
                 } catch (error) {
-                  console.error(`Error minimizing ${comment.id}:`, error);
+                  console.error(`Error minimizing ${comment.databaseId}:`, error);
                 }
               }
             }
